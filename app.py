@@ -8,6 +8,14 @@ from datetime import date, timedelta
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import streamlit as st
+
+# Page configuration
+st.set_page_config(
+    page_title="Living Company Simulation System",
+    page_icon="🏢",
+    layout="wide"
+)
 
 NODES = ["housing", "demand", "capacity", "inventory_pressure", "labor_pressure",
          "labor_cost", "availability", "customer_exp", "price_power", "competition"]
@@ -38,19 +46,6 @@ for s, d, w, _ in EDGES:
 
 DECAY = 0.75
 SIGMA = np.array([0.010, 0.025, 0.012, 0.015, 0.015, 0.012, 0.015, 0.015, 0.020, 0.012])
-
-LABELS = {
-    "housing": ("Soft", "Neutral", "Strong"),
-    "demand": ("Weak", "Normal", "Strong"),
-    "capacity": ("Contracting", "Normal", "Expanding"),
-    "inventory_pressure": ("Tight", "Balanced", "Excess"),
-    "labor_pressure": ("Easing", "Stable", "Rising"),
-    "labor_cost": ("Falling", "Stable", "Rising"),
-    "availability": ("Constrained", "Normal", "Abundant"),
-    "customer_exp": ("Worsening", "Stable", "Improving"),
-    "price_power": ("Weak", "Stable", "Strong"),
-    "competition": ("Easing", "Stable", "Intensifying"),
-}
 
 def calc_revenue_index(x: np.ndarray) -> np.ndarray:
     d, cap = x[..., IDX["demand"]], x[..., IDX["capacity"]]
@@ -215,14 +210,6 @@ SCENARIOS = {
     "Supply constraint": {"shocks": [("demand", .02, 0, 9), ("availability", -.06, 0, 9)]},
 }
 
-COUNTERFACTUALS = {
-    "Demand -10pct": persistent_shock("demand", -.10),
-    "Labor cost up fast": {"shocks": [("labor_cost", .02, 0, 9), ("labor_pressure", .02, 0, 9)]},
-    "Supply fix": persistent_shock("availability", .08),
-    "Pricing power down": persistent_shock("price_power", -.10),
-    "Capacity delay": {"shocks": [("capacity", -.04, 0, 6)]},
-}
-
 @dataclass
 class Result:
     name: str
@@ -306,91 +293,83 @@ class Simulator:
         ri = calc_revenue_index(X[:, 1:])
         return Result(name, X, self.base * ri, calc_margin(X[:, 1:], ri), draws["wmult"], cidx)
 
-def summarize_result(res, runrate):
-    q = lambda a, p: float(np.percentile(a, p))
-    return {
-        "Rev Mean ($B)": res.rev12.mean(), "Rev P5": q(res.rev12, 5), "Rev P50": q(res.rev12, 50),
-        "Rev P95": q(res.rev12, 95), "P(Rev > RunRate)": float((res.rev12 > runrate).mean()),
-        "Margin Mean": res.end_margin.mean(), "Margin P5": q(res.end_margin, 5),
-        "Margin P95": q(res.end_margin, 95), "OP Mean ($B)": res.op12.mean(),
-    }
+# ----------------- Streamlit UI -----------------
+st.title("🏢 Living Company - AI Business Change Simulation System")
+st.markdown("Interactive retail business evolution forecasting dashboard powered by system dynamics and Monte Carlo simulation.")
 
-def make_table(results, runrate):
-    return pd.DataFrame({r.name: summarize_result(r, runrate) for r in results}).T
+# Sidebar controls
+st.sidebar.header("⚙️ Simulation Settings")
+paths_count = st.sidebar.slider("Monte Carlo Paths", min_value=100, max_value=2000, value=500, step=100)
+selected_scenario = st.sidebar.selectbox("Select Scenario", list(SCENARIOS.keys()))
 
-def spearman_corr(a, b):
-    ra, rb = pd.Series(a).rank().values, pd.Series(b).rank().values
-    if ra.std() == 0 or rb.std() == 0: return 0.0
-    return float(np.corrcoef(ra, rb)[0, 1])
+as_of = date(2026, 10, 9)
+store = SignalStore()
+ex = SignalExtractor()
 
-def get_sensitivity(res):
-    avg = res.X[:, 1:].mean(1)
-    nodes = pd.DataFrame({"Driver": NODES,
-                          "Rev Corr": [spearman_corr(avg[:, i], res.rev12) for i in range(N)],
-                          "Margin Corr": [spearman_corr(avg[:, i], res.end_margin) for i in range(N)]})
-    nodes["Importance"] = nodes[["Rev Corr", "Margin Corr"]].abs().max(axis=1)
-    return nodes.sort_values("Importance", ascending=False)
+docs = [
+    ("Posted 140 new distribution center and logistics job openings across the Southeast", "job_posting", 5),
+    ("Hiring is increasingly focused on distribution operations (warehouse job postings up)", "job_posting", 40),
+    ("Management: we expect to expand our distribution footprint next year", "call", 20),
+    ("Customers still report delivery delays and complain about service", "review", 3),
+]
+for text, src, ago in docs:
+    for sg in ex.extract(text, src, as_of - timedelta(days=ago)):
+        store.add(sg)
 
-def explain_sig(sg, on):
-    lines = [f"[{sg.sid}] Text: \"{sg.text[:80]}\" (Rel: {sg.relevance(on):.2f})"]
-    for h in sg.hypotheses:
-        eff_str = ", ".join(f"{k}{v:+.3f}" for k, v in h.effects.items()) or "none"
-        lines.append(f"   -> {h.prob:.0%} {h.name}: {eff_str}")
-    return "\n".join(lines)
+sigs = store.all()
+sim = Simulator("Retailer A", sigs, as_of, base_rev=13.0, init_state={"demand": .03})
+runrate = sim.base * 12
+draws = sim.get_draws(paths_count)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--paths", type=int, default=1000)
-    a = ap.parse_args()
+# Run simulation
+base_res = sim.run(draws, SCENARIOS["Baseline"], "Baseline")
+current_res = sim.run(draws, SCENARIOS[selected_scenario], selected_scenario)
 
-    as_of = date(2026, 10, 9)
-    store = SignalStore()
-    ex = SignalExtractor()
-    
-    docs = [
-        ("Posted 140 new distribution center and logistics job openings across the Southeast", "job_posting", 5),
-        ("Hiring is increasingly focused on distribution operations (warehouse job postings up)", "job_posting", 40),
-        ("Management: we expect to expand our distribution footprint next year", "call", 20),
-        ("Customers still report delivery delays and complain about service", "review", 3),
-    ]
-    for text, src, ago in docs:
-        for sg in ex.extract(text, src, as_of - timedelta(days=ago)):
-            store.add(sg)
+# Key metrics display
+st.subheader(f"📊 Current Scenario Performance: {selected_scenario}")
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Expected 12M Revenue", f"${current_res.rev12.mean():.2f}B", delta=f"{current_res.rev12.mean() - base_res.rev12.mean():+.2f}B vs Baseline")
+with col2:
+    st.metric("Avg Operating Margin", f"{current_res.end_margin.mean()*100:.2f}%", delta=f"{(current_res.end_margin.mean() - base_res.end_margin.mean())*100:+.2f}pp")
+with col3:
+    st.metric("P(Rev > RunRate)", f"{float((current_res.rev12 > runrate).mean()):.1%}")
+with col4:
+    st.metric("System Conflict Index", f"{current_res.conflict:.2f}")
 
-    sigs = store.all()
-    sim = Simulator("Retailer A", sigs, as_of, base_rev=13.0, init_state={"demand": .03})
-    runrate = sim.base * 12
-    draws = sim.get_draws(a.paths)
+# Chart display
+st.markdown("---")
+st.subheader("📈 12-Month Node Evolution Trend")
+months = [f"M+{i}" for i in range(1, 13)]
+mean_path = current_res.X[:, 1:].mean(axis=0)
+df_trend = pd.DataFrame(mean_path, index=months, columns=NODES)
+st.line_chart(df_trend[["demand", "capacity", "customer_exp", "inventory_pressure", "labor_cost"]])
 
-    print("Running Living Company simulation demo...")
-    base = sim.run(draws, SCENARIOS["Baseline"], "Baseline")
-    
-    print("\n--- Signals Parsed ---")
+# Tabs for Signals and Summary Table
+tab1, tab2 = st.tabs(["📝 Parsed Signals & Hypotheses", "📋 Scenario Comparison Summary"])
+
+with tab1:
+    st.markdown("### Automatically Extracted Internal & External Signals:")
     for s in sigs:
-        print(explain_sig(s, as_of))
+        with st.expander(f"[{s.sid.upper()}] Source: {s.source} (Confidence: {s.confidence:.2f})"):
+            st.write(f"**Text**: {s.text}")
+            st.write(f"**Half-life**: {s.half_life} days | **Relevance**: {s.relevance(as_of):.2f}")
+            for h in s.hypotheses:
+                st.text(f"  -> Prob {h.prob:.0%} | Hypothesis: {h.name} | Effects: {h.effects}")
 
-    print("\n--- Scenarios ---")
-    res = [sim.run(draws, s, nm) for nm, s in SCENARIOS.items()]
-    print(make_table(res, runrate).round(3).to_string())
+with tab2:
+    st.markdown("### Multi-Scenario Simulation Summary Table:")
+    all_res = [sim.run(draws, s, nm) for nm, s in SCENARIOS.items()]
+    summary_data = []
+    for r in all_res:
+        summary_data.append({
+            "Scenario": r.name,
+            "Mean Revenue ($B)": round(r.rev12.mean(), 2),
+            "Revenue P5 ($B)": round(float(np.percentile(r.rev12, 5)), 2),
+            "Revenue P95 ($B)": round(float(np.percentile(r.rev12, 95)), 2),
+            "End Margin": f"{r.end_margin.mean()*100:.2f}%",
+            "P(Rev > RunRate)": f"{float((r.rev12 > runrate).mean()):.1%}"
+        })
+    st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 
-    print("\n--- Counterfactuals (delta vs baseline) ---")
-    cf = [sim.run(draws, s, nm) for nm, s in COUNTERFACTUALS.items()]
-    for r in cf:
-        print(f"{r.name:<22} dRev={r.rev12.mean()-base.rev12.mean():+.2f}B  "
-              f"dMargin={(r.end_margin.mean()-base.end_margin.mean())*100:+.2f}pp")
-
-    print("\n--- Audit trail (signal ablation) ---")
-    for sg in sigs:
-        r = sim.run(draws, SCENARIOS["Baseline"], "x", disabled=(sg.sid,))
-        print(f"{sg.sid:<22} contributes {base.rev12.mean()-r.rev12.mean():+.2f}B revenue")
-
-    print("\n--- Investor override: hiring = turnover backfill ---")
-    ov = {"distribution_hiring": {"turnover_backfill": .70, "capacity_expansion": .10}}
-    mine = sim.run(draws, SCENARIOS["Baseline"], "mine", overrides=ov)
-    print(f"Rev {base.rev12.mean():.1f} -> {mine.rev12.mean():.1f}")
-
-    print("\n--- Top drivers ---")
-    print(get_sensitivity(base).head(5).round(3).to_string(index=False))
-
-if __name__ == "__main__":
-    main()
+st.success("🎉 Simulation successfully executed! You can adjust parameters and scenarios anytime from the sidebar.")
